@@ -20,7 +20,8 @@
 
 // Board Manager index:
 // https://raw.githubusercontent.com/RAKwireless/RAKwireless-Arduino-BSP-Index/main/package_rakwireless_index.json
-#include <Adafruit_TinyUSB.h>
+#include <bluefruit.h>
+
 #define DEBUG 1
 
 // TEXAS ELECTRONICS TR-525M
@@ -39,12 +40,26 @@ float hourlyRainfall = 0.0f;
 float dailyRainfall = 0.0f;
 float totalRainfall = 0.0f;
 
+// BLUETOOTH
+BLEDfu bledfu;  // OTA updates
+#define MAX_SAMPLERS 4
+typedef struct {
+  char name[16 + 1];
+  uint16_t conn_handle;
+  BLEClientUart clientUart;
+} Peripheral;
+Peripheral peripherals[MAX_SAMPLERS];
+uint8_t connections = 0;
+#define BLE_BUF_SIZE 20  // default BLEUart packet size
+char bleMsg[BLE_BUF_SIZE];
+char bleName[16] = "RAINFALL LOGGER";
+
 void setup() {
 #if DEBUG
   Serial.begin(115200);
   uint32_t start = millis();
   while (!Serial && millis() - start < 3000) delay(10);  // wait up to 3 s for a monitor
-  Serial.printf("Starting TR-525M Logger\n");
+  Serial.printf("Starting %s\n", bleName);
 #endif
 
   pinMode(RAIN_PIN, INPUT_PULLUP);
@@ -55,6 +70,8 @@ void setup() {
     digitalPinToInterrupt(RAIN_PIN),
     tipISR,
     FALLING);
+
+  ble_init();
 }
 
 void loop() {
@@ -130,4 +147,100 @@ void processTips() {
       totalRainfall);
 #endif
   }
+}
+
+bool ble_init(void) {
+  // Bandwidth and connection settings must be set before Bluefruit.begin().
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  Bluefruit.configPrphConn(92, BLE_GAP_EVENT_LENGTH_MIN, 16, 16);
+  // Disable connection LED
+  Bluefruit.autoConnLed(false);
+  if (!Bluefruit.begin(0, MAX_SAMPLERS)) { return false; }
+  Bluefruit.setTxPower(8);  // Check bluefruit.h for supported values
+  Bluefruit.setName(bleName);
+  Bluefruit.Central.setConnectCallback(central_connect_callback);
+  Bluefruit.Central.setDisconnectCallback(central_disconnect_callback);
+  bledfu.begin();
+  for (uint8_t id = 0; id < MAX_SAMPLERS; id++) {
+    memset(peripherals[id].name, 0, sizeof(peripherals[id].name));
+    peripherals[id].conn_handle = BLE_CONN_HANDLE_INVALID;
+    peripherals[id].clientUart.begin();
+  }
+  Bluefruit.Scanner.setRxCallback(scan_callback);
+  Bluefruit.Scanner.restartOnDisconnect(true);
+  Bluefruit.Scanner.setInterval(160, 80);
+  Bluefruit.Scanner.filterUuid(BLEUART_UUID_SERVICE);
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.start(0);
+  return true;
+}
+
+void ble_send(void) {
+  snprintf(bleMsg,
+           sizeof(bleMsg),
+           "%.1f,%.1f,%.1f",
+           hourlyRainfall,
+           dailyRainfall,
+           totalRainfall);
+  // Send data to all peripherals, let them decide whether or not to sample
+  if (Bluefruit.Central.connected()) {
+    for (uint8_t id = 0; id < MAX_SAMPLERS; id++) {
+      Peripheral* peer = &peripherals[id];
+      if (peer->clientUart.discovered()) {
+        peer->clientUart.write(bleMsg);
+      }
+    }
+  }
+}
+
+void scan_callback(ble_gap_evt_adv_report_t* report) {
+#if DEBUG
+  Serial.print("BLE UART service detected. Connecting ... ");
+#endif
+  Bluefruit.Central.connect(report);
+}
+
+void central_connect_callback(uint16_t conn_handle) {
+  int id = findConnHandle(BLE_CONN_HANDLE_INVALID);
+  if (id < 0) { return; }
+  Peripheral* peer = &peripherals[id];
+  peer->conn_handle = conn_handle;
+  Bluefruit.Connection(conn_handle)->getPeerName(peer->name, sizeof(peer->name) - 1);
+#if DEBUG
+  Serial.printf("Connected to %s\n", peer->name);
+#endif
+  if (peer->clientUart.discover(conn_handle)) {
+#if DEBUG
+    Serial.println("Found it");
+#endif
+    peer->clientUart.enableTXD();
+    connections++;
+    if (connections < MAX_SAMPLERS) { Bluefruit.Scanner.start(0); }
+  } else {
+#if DEBUG
+    Serial.println("Found NONE");
+#endif
+    Bluefruit.disconnect(conn_handle);
+  }
+}
+
+void central_disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+  (void)conn_handle;
+  (void)reason;
+  int id = findConnHandle(conn_handle);
+  if (id < 0) { return; }
+  memset(peripherals[id].name, 0, sizeof(peripherals[id].name));
+  peripherals[id].conn_handle = BLE_CONN_HANDLE_INVALID;
+  connections--;
+  Bluefruit.Scanner.start(0);
+#if DEBUG
+  Serial.printf("%s disconnected, reason = %#X\n", peripherals[id].name, reason);
+#endif
+}
+
+int findConnHandle(uint16_t conn_handle) {
+  for (uint8_t id = 0; id < MAX_SAMPLERS; id++) {
+    if (conn_handle == peripherals[id].conn_handle) { return id; }
+  }
+  return -1;
 }
