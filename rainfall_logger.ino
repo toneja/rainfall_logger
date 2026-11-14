@@ -21,25 +21,29 @@
 // Board Manager index:
 // https://raw.githubusercontent.com/RAKwireless/RAKwireless-Arduino-BSP-Index/main/package_rakwireless_index.json
 #include <bluefruit.h>
-#include <U8g2lib.h>         // http://librarymanager/All#U8g2
+#include <U8g2lib.h>  // http://librarymanager/All#U8g2
 
 #define DEBUG 1
 
 // DISPLAY
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2);  // R2 = Rotate display 180°
 char displayMsg[32];
+#define OLED_REFRESH_MS 1000UL
+uint32_t lastOledMs = 0;
 
 // TEXAS ELECTRONICS TR-525M
 #define RAIN_PIN WB_IO3
 #define MM_PER_TIP 0.1f
 #define HOUR_MS 3600000UL
 #define DEBOUNCE_US 5000UL
-volatile uint32_t tipCount = 0;
-volatile uint32_t lastTipMs = 0;
+#define TIP_QUEUE_SIZE 32
+volatile uint32_t tipHead = 0;               // total tips accepted by ISR
+volatile uint32_t tipTimes[TIP_QUEUE_SIZE];  // millis() stamp of each tip
 volatile uint32_t lastTipUs = 0;
 volatile bool firstTip = true;
-uint32_t reportedTips = 0;
-uint32_t currentHour = 0;
+uint32_t reportedTips = 0;  // tips consumed by processTips()
+uint32_t hourStartMs = 0;   // millis() when current bin began
+uint32_t currentHour = 0;   // monotonic hour index
 uint32_t hourlyBins[24] = { 0 };
 float hourlyRainfall = 0.0f;
 float dailyRainfall = 0.0f;
@@ -69,7 +73,7 @@ void setup() {
 
   pinMode(RAIN_PIN, INPUT_PULLUP);
 
-  currentHour = millis() / HOUR_MS;
+  hourStartMs = millis();
 
   attachInterrupt(
     digitalPinToInterrupt(RAIN_PIN),
@@ -83,8 +87,14 @@ void setup() {
 }
 
 void loop() {
-  updateHourlyBins();
   processTips();
+
+  // Timer-driven OLED refresh keeps values current during quiet periods
+  // and hour rollovers, independent of tip activity.
+  if (millis() - lastOledMs >= OLED_REFRESH_MS) {
+    lastOledMs = millis();
+    oled_update();
+  }
 }
 
 void sensor_init(void) {
@@ -125,53 +135,69 @@ void tipISR() {
   if (firstTip || (uint32_t)(now - lastTipUs) >= DEBOUNCE_US) {
     firstTip = false;
     lastTipUs = now;
-    lastTipMs = millis();
-    tipCount++;
+    tipTimes[tipHead % TIP_QUEUE_SIZE] = millis();  // stamp each tip
+    tipHead++;
   }
 }
 
-void updateHourlyBins() {
-  uint32_t hour = millis() / HOUR_MS;
-  uint32_t elapsed = hour - currentHour;
+// Advance the hourly bins to nowMs. Unsigned subtraction keeps this correct
+// across the ~49.7-day millis() rollover. Never moves backward.
+void updateHourlyBins(uint32_t nowMs) {
+  int32_t sinceStart = (int32_t)(nowMs - hourStartMs);
+  if (sinceStart < (int32_t)HOUR_MS) { return; }  // still inside current hour
 
-  if (elapsed > 0) {
-    if (elapsed >= 24) {
-      memset(hourlyBins, 0, sizeof(hourlyBins));
-    } else {
-      for (uint32_t i = 1; i <= elapsed; i++) {
-        hourlyBins[(currentHour + i) % 24] = 0;
-      }
+  uint32_t elapsed = (uint32_t)sinceStart / HOUR_MS;  // whole hours passed
+
+  if (elapsed >= 24) {
+    memset(hourlyBins, 0, sizeof(hourlyBins));
+  } else {
+    for (uint32_t i = 1; i <= elapsed; i++) {
+      hourlyBins[(currentHour + i) % 24] = 0;
     }
-
-    currentHour = hour;
   }
 
-  hourlyRainfall = hourlyBins[currentHour % 24] * MM_PER_TIP;
+  currentHour += elapsed;
+  hourStartMs += elapsed * HOUR_MS;
+}
 
+void recalcRainfall(void) {
   uint32_t dailyTips = 0;
   for (uint8_t i = 0; i < 24; i++) {
     dailyTips += hourlyBins[i];
   }
-
+  hourlyRainfall = hourlyBins[currentHour % 24] * MM_PER_TIP;
   dailyRainfall = dailyTips * MM_PER_TIP;
 }
 
 void processTips() {
-  uint32_t tips;
-  uint32_t timestamp;
+  // Read the clock before the tip count. Any tip stamped before snapNow is
+  // already in the ring when tipHead is read, so the hour clock can safely
+  // advance to snapNow at the end without binning a pre-boundary tip into
+  // the new hour.
+  uint32_t snapNow = millis();
+  uint32_t head;
 
   noInterrupts();
-  tips = tipCount;
-  timestamp = lastTipMs;
+  head = tipHead;
   interrupts();
 
-  while (reportedTips < tips) {
+  // If the ISR lapped the consumer, the oldest tips were overwritten; skip them.
+  if ((uint32_t)(head - reportedTips) > TIP_QUEUE_SIZE) {
+    reportedTips = head - TIP_QUEUE_SIZE;
+  }
+
+  while (reportedTips < head) {
+    uint32_t ts;
+    noInterrupts();
+    ts = tipTimes[reportedTips % TIP_QUEUE_SIZE];
+    interrupts();
     reportedTips++;
 
+    updateHourlyBins(ts);  // bin each tip at its own timestamp
     hourlyBins[currentHour % 24]++;
     totalRainfall += MM_PER_TIP;
+    recalcRainfall();
 
-    updateHourlyBins();
     // Send BLE data
     if (Bluefruit.Central.connected()) {
       digitalWrite(LED_BLUE, HIGH);
@@ -179,10 +205,9 @@ void processTips() {
       delay(2);
       digitalWrite(LED_BLUE, LOW);
     }
-    oled_update();
 
 #if DEBUG
-    uint32_t seconds = timestamp / 1000UL;
+    uint32_t seconds = ts / 1000UL;
 
     Serial.printf(
       "%02lu:%02lu:%02lu | TIP #%lu | Hour: %.1f mm | 24h: %.1f mm | Total: %.1f mm\n",
@@ -195,6 +220,10 @@ void processTips() {
       totalRainfall);
 #endif
   }
+
+  // Roll the clock forward even when no tips arrived, so an empty hour clears.
+  updateHourlyBins(snapNow);
+  recalcRainfall();
 }
 
 bool ble_init(void) {
