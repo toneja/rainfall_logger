@@ -132,6 +132,13 @@ void processTips() {
     totalRainfall += MM_PER_TIP;
 
     updateHourlyBins();
+    // Send BLE data
+    if (Bluefruit.Central.connected()) {
+      digitalWrite(LED_BLUE, HIGH);
+      ble_send();
+      delay(2);
+      digitalWrite(LED_BLUE, LOW);
+    }
 
 #if DEBUG
     uint32_t seconds = timestamp / 1000UL;
