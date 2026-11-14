@@ -21,8 +21,13 @@
 // Board Manager index:
 // https://raw.githubusercontent.com/RAKwireless/RAKwireless-Arduino-BSP-Index/main/package_rakwireless_index.json
 #include <bluefruit.h>
+#include <U8g2lib.h>         // http://librarymanager/All#U8g2
 
 #define DEBUG 1
+
+// DISPLAY
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2);  // R2 = Rotate display 180°
+char displayMsg[32];
 
 // TEXAS ELECTRONICS TR-525M
 #define RAIN_PIN WB_IO3
@@ -52,7 +57,7 @@ Peripheral peripherals[MAX_SAMPLERS];
 uint8_t connections = 0;
 #define BLE_BUF_SIZE 20  // default BLEUart packet size
 char bleMsg[BLE_BUF_SIZE];
-char bleName[16] = "RAINFALL LOGGER";
+char bleName[12] = "RAIN LOGGER";
 
 void setup() {
 #if DEBUG
@@ -71,12 +76,47 @@ void setup() {
     tipISR,
     FALLING);
 
+  sensor_init();
+  oled_init();
   ble_init();
+  oled_update();
 }
 
 void loop() {
   updateHourlyBins();
   processTips();
+}
+
+void sensor_init(void) {
+  // power up the sensors
+  pinMode(WB_IO2, OUTPUT);
+  digitalWrite(WB_IO2, HIGH);
+  delay(1000);
+}
+
+// DISPLAY
+void oled_init(void) {
+  u8g2.begin();
+  u8g2.setContrast(255);  // Brightness range [0-255]
+  u8g2.setFont(u8g2_font_9x15_tf);
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 15, bleName);
+  u8g2.sendBuffer();
+}
+
+void oled_update(void) {
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 15, bleName);
+  memset(displayMsg, 0, sizeof(displayMsg));
+  snprintf(displayMsg, sizeof(displayMsg), "Hourly  %.1fmm", hourlyRainfall);
+  u8g2.drawStr(0, 30, displayMsg);
+  memset(displayMsg, 0, sizeof(displayMsg));
+  snprintf(displayMsg, sizeof(displayMsg), "Daily   %.1fmm", dailyRainfall);
+  u8g2.drawStr(0, 45, displayMsg);
+  memset(displayMsg, 0, sizeof(displayMsg));
+  snprintf(displayMsg, sizeof(displayMsg), "Total   %.1fmm", totalRainfall);
+  u8g2.drawStr(0, 60, displayMsg);
+  u8g2.sendBuffer();
 }
 
 void tipISR() {
@@ -139,6 +179,7 @@ void processTips() {
       delay(2);
       digitalWrite(LED_BLUE, LOW);
     }
+    oled_update();
 
 #if DEBUG
     uint32_t seconds = timestamp / 1000UL;
