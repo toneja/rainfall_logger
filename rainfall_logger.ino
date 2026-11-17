@@ -21,7 +21,9 @@
 // Board Manager index:
 // https://raw.githubusercontent.com/RAKwireless/RAKwireless-Arduino-BSP-Index/main/package_rakwireless_index.json
 #include <bluefruit.h>
-#include <U8g2lib.h>  // http://librarymanager/All#U8g2
+#include <SparkFun_u-blox_GNSS_Arduino_Library.h>  // http://librarymanager/All#SparkFun%20u-blox%20GNSS
+#include <U8g2lib.h>                               // http://librarymanager/All#U8g2
+#include "SD.h"                                    // http://librarymanager/All#SD
 
 #define DEBUG 1
 
@@ -63,6 +65,13 @@ uint8_t connections = 0;
 char bleMsg[BLE_BUF_SIZE];
 char bleName[12] = "RAIN LOGGER";
 
+// Log files
+File csvFile;
+
+// GPS: position + timestamp
+SFE_UBLOX_GNSS g_myGNSS;
+char timestamp[20];
+
 void setup() {
 #if DEBUG
   Serial.begin(115200);
@@ -82,6 +91,9 @@ void setup() {
 
   sensor_init();
   oled_init();
+  led_init();
+  sd_init();
+  gps_init();
   ble_init();
   oled_update();
 }
@@ -127,6 +139,84 @@ void oled_update(void) {
   snprintf(displayMsg, sizeof(displayMsg), "Total   %.1fmm", totalRainfall);
   u8g2.drawStr(0, 60, displayMsg);
   u8g2.sendBuffer();
+}
+
+void led_init(void) {
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  led_loop(10);
+}
+
+void led_loop(int count) {
+  for (uint8_t i = 0; i < count * 2; i++) {
+    digitalToggle(LED_GREEN);
+    delay(100);
+    digitalToggle(LED_BLUE);
+    delay(100);
+  }
+}
+
+void sd_init(void) {
+  // Check if card is inserted
+  pinMode(WB_IO6, INPUT_PULLUP);
+  if (!digitalRead(WB_IO6) == LOW) { return; }
+  if (!SD.begin()) { return; }
+#if DEBUG
+  Serial.println("SD Card mounted.");
+#endif
+  char csvFilename[12 + 1];
+  for (uint8_t i = 0; i <= 99; i++) {
+    snprintf(csvFilename, sizeof(csvFilename), "RAIN_%02d.csv", i);
+    if (!SD.exists(csvFilename)) { break; }
+  }
+#if DEBUG
+  Serial.printf("Output file: %s\n", csvFilename);
+#endif
+  csvFile = SD.open(csvFilename, FILE_WRITE);
+  if (!csvFile) { return; }
+  if (csvFile.size() == 0) {
+    csvFile.println("Date,Time(UTC),Tips,Hourly,Daily,Total");
+    csvFile.flush();
+  }
+}
+
+void gps_init(void) {
+  if (!g_myGNSS.begin()) { return; }
+  g_myGNSS.setI2COutput(COM_TYPE_UBX);
+  g_myGNSS.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT);
+  // Wait on the GPS fix for accurate timestamps
+#if DEBUG
+  Serial.print("Searching for GPS...");
+  uint16_t fixTime = 0;
+#endif
+  u8g2.clearBuffer();
+  u8g2.drawStr(5, 30, "SEARCHING FOR");
+  u8g2.drawStr(19, 45, "GPS SIGNAL");
+  u8g2.sendBuffer();
+  while (g_myGNSS.getFixType() < 3) {
+    digitalToggle(LED_GREEN);
+    digitalToggle(LED_BLUE);
+    delay(1000);
+#if DEBUG
+    Serial.print(".");
+    fixTime++;
+    if (fixTime == 10) { break; }  // don't loop forever
+#endif
+  }
+  // make sure LEDs are off
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_BLUE, LOW);
+#if DEBUG
+  Serial.printf("GPS fix acquired in %d seconds.\n", fixTime);
+#endif
+}
+
+void gps_gettime(void) {
+  snprintf(timestamp,
+           sizeof(timestamp),
+           "%d-%02d-%02d,%02d:%02d:%02d",
+           g_myGNSS.getYear(), g_myGNSS.getMonth(), g_myGNSS.getDay(),
+           g_myGNSS.getHour(), g_myGNSS.getMinute(), g_myGNSS.getSecond());
 }
 
 void tipISR() {
@@ -206,14 +296,22 @@ void processTips() {
       digitalWrite(LED_BLUE, LOW);
     }
 
-#if DEBUG
-    uint32_t seconds = ts / 1000UL;
+    gps_gettime();
+    if (csvFile) {
+      csvFile.printf(
+        "%s | TIP #%lu | Hour: %.1f mm | 24h: %.1f mm | Total: %.1f mm\n",
+        timestamp,
+        (unsigned long)reportedTips,
+        hourlyRainfall,
+        dailyRainfall,
+        totalRainfall);
+      csvFile.flush();
+    }
 
+#if DEBUG
     Serial.printf(
-      "%02lu:%02lu:%02lu | TIP #%lu | Hour: %.1f mm | 24h: %.1f mm | Total: %.1f mm\n",
-      (unsigned long)(seconds / 3600UL),
-      (unsigned long)((seconds / 60UL) % 60UL),
-      (unsigned long)(seconds % 60UL),
+      "%s | TIP #%lu | Hour: %.1f mm | 24h: %.1f mm | Total: %.1f mm\n",
+      timestamp,
       (unsigned long)reportedTips,
       hourlyRainfall,
       dailyRainfall,
